@@ -22,6 +22,8 @@ from tool_scholar import *
 from tool_python import *
 from tool_search import *
 from tool_visit import *
+from hf_spaces_client import create_client
+from tool_logger import ToolLogger
 
 OBS_START = '<tool_response>'
 OBS_END = '\n</tool_response>'
@@ -48,66 +50,62 @@ class MultiTurnReactAgent(FnCallAgent):
     def __init__(self,
                  function_list: Optional[List[Union[str, Dict, BaseTool]]] = None,
                  llm: Optional[Union[Dict, BaseChatModel]] = None,
+                 tool_logger: Optional[ToolLogger] = None,
                  **kwargs):
 
         self.llm_generate_cfg = llm["generate_cfg"]
         self.llm_local_path = llm["model"]
+        self.tool_logger = tool_logger
+
+        # Initialize API client
+        # Check if we should use OpenRouter or HF Spaces
+        use_openrouter = os.getenv("USE_OPENROUTER", "false").lower() == "true"
+        self.api_client = create_client(use_openrouter=use_openrouter)
+        print(f"✅ API client initialized: {'OpenRouter' if use_openrouter else 'HF Spaces'}")
 
     def sanity_check_output(self, content):
         return "<think>" in content and "</think>" in content
     
     def call_server(self, msgs, planning_port, max_tries=10):
-        
-        openai_api_key = "EMPTY"
-        openai_api_base = f"http://127.0.0.1:{planning_port}/v1"
+        """
+        Call the API server (HF Spaces or OpenRouter) with retry logic.
 
-        client = OpenAI(
-            api_key=openai_api_key,
-            base_url=openai_api_base,
-            timeout=600.0,
-        )
+        Args:
+            msgs: List of messages to send
+            planning_port: Port number (kept for compatibility, unused for API)
+            max_tries: Maximum retry attempts
 
-        base_sleep_time = 1 
-        for attempt in range(max_tries):
-            try:
-                print(f"--- Attempting to call the service, try {attempt + 1}/{max_tries} ---")
-                chat_response = client.chat.completions.create(
-                    model=self.model,
-                    messages=msgs,
-                    stop=["\n<tool_response>", "<tool_response>"],
-                    temperature=self.llm_generate_cfg.get('temperature', 0.6),
-                    top_p=self.llm_generate_cfg.get('top_p', 0.95),
-                    logprobs=True,
-                    max_tokens=10000,
-                    presence_penalty=self.llm_generate_cfg.get('presence_penalty', 1.1)
-                )
-                content = chat_response.choices[0].message.content
+        Returns:
+            Response content string
+        """
 
-                # OpenRouter provides API calling. If you want to use OpenRouter, you need to uncomment line 89 - 90.
-                # reasoning_content = "<think>\n" + chat_response.choices[0].message.reasoning.strip() + "\n</think>"
-                # content = reasoning_content + content                
-                
-                if content and content.strip():
-                    print("--- Service call successful, received a valid response ---")
-                    return content.strip()
-                else:
-                    print(f"Warning: Attempt {attempt + 1} received an empty response.")
+        try:
+            print(f"--- Calling API service ---")
 
-            except (APIError, APIConnectionError, APITimeoutError) as e:
-                print(f"Error: Attempt {attempt + 1} failed with an API or network error: {e}")
-            except Exception as e:
-                print(f"Error: Attempt {attempt + 1} failed with an unexpected error: {e}")
+            # Use the initialized API client with its built-in retry logic
+            response = self.api_client.chat_completion(
+                messages=msgs,
+                temperature=self.llm_generate_cfg.get('temperature', 0.85),
+                top_p=self.llm_generate_cfg.get('top_p', 0.95),
+                max_tokens=10000,
+                presence_penalty=self.llm_generate_cfg.get('presence_penalty', 1.1),
+                stop=["\n<tool_response>", "<tool_response>"],
+                max_retries=max_tries
+            )
 
-            if attempt < max_tries - 1:
-                sleep_time = base_sleep_time * (2 ** attempt) + random.uniform(0, 1)
-                sleep_time = min(sleep_time, 30) 
-                
-                print(f"Retrying in {sleep_time:.2f} seconds...")
-                time.sleep(sleep_time)
+            # Extract content using client method
+            content = self.api_client.extract_content(response)
+
+            if content and content.strip():
+                print("--- Service call successful, received a valid response ---")
+                return content.strip()
             else:
-                print("Error: All retry attempts have been exhausted. The call has failed.")
-        
-        return f"vllm server error!!!"
+                print("Warning: Received an empty response.")
+                return "API server error: empty response"
+
+        except Exception as e:
+            print(f"Error: API call failed after all retries: {e}")
+            return f"API server error: {str(e)}"
 
     def count_tokens(self, messages):
         tokenizer = AutoTokenizer.from_pretrained(self.llm_local_path) 
@@ -140,6 +138,9 @@ class MultiTurnReactAgent(FnCallAgent):
             if time.time() - start_time > 150 * 60:  # 150 minutes in seconds
                 prediction = 'No answer found after 2h30mins'
                 termination = 'No answer found after 2h30mins'
+                # Write tool log summary
+                if self.tool_logger:
+                    self.tool_logger.write_summary(question, answer, prediction, termination, round)
                 result = {
                     "question": question,
                     "answer": answer,
@@ -162,15 +163,38 @@ class MultiTurnReactAgent(FnCallAgent):
                     if "python" in tool_call.lower():
                         try:
                             code_raw=content.split('<tool_call>')[1].split('</tool_call>')[0].split('<code>')[1].split('</code>')[0].strip()
+                            # Log Python tool call
+                            python_start = time.time()
                             result = TOOL_MAP['PythonInterpreter'].call(code_raw)
-                        except:
+                            python_duration = time.time() - python_start
+                            if self.tool_logger:
+                                self.tool_logger.log_tool_call(
+                                    round_num=round,
+                                    tool_name="PythonInterpreter",
+                                    tool_input={"code": code_raw},
+                                    tool_output=result,
+                                    duration=python_duration,
+                                    success=True,
+                                    error=None
+                                )
+                        except Exception as e:
                             result = "[Python Interpreter Error]: Formatting error."
+                            if self.tool_logger:
+                                self.tool_logger.log_tool_call(
+                                    round_num=round,
+                                    tool_name="PythonInterpreter",
+                                    tool_input={"code": tool_call},
+                                    tool_output=result,
+                                    duration=0,
+                                    success=False,
+                                    error=str(e)
+                                )
 
                     else:
                         tool_call = json5.loads(tool_call)
                         tool_name = tool_call.get('name', '')
                         tool_args = tool_call.get('arguments', {})
-                        result = self.custom_call_tool(tool_name, tool_args)
+                        result = self.custom_call_tool(tool_name, tool_args, round_num=round)
 
                 except:
                     result = 'Error: Tool call is not a valid JSON. Tool call must contain a valid "name" and "arguments" field.'
@@ -189,7 +213,7 @@ class MultiTurnReactAgent(FnCallAgent):
 
             if token_count > max_tokens:
                 print(f"Token quantity exceeds the limit: {token_count} > {max_tokens}")
-                
+
                 messages[-1]['content'] = "You have now reached the maximum context length you can handle. You should stop making tool calls and, based on all the information above, think again and provide what you consider the most likely answer in the following format:<think>your final thinking</think>\n<answer>your answer</answer>"
                 content = self.call_server(messages, planning_port)
                 messages.append({"role": "assistant", "content": content.strip()})
@@ -199,6 +223,9 @@ class MultiTurnReactAgent(FnCallAgent):
                 else:
                     prediction = messages[-1]['content']
                     termination = 'format error: generate an answer as token limit reached'
+                # Write tool log summary
+                if self.tool_logger:
+                    self.tool_logger.write_summary(question, answer, prediction, termination, round)
                 result = {
                     "question": question,
                     "answer": answer,
@@ -216,6 +243,9 @@ class MultiTurnReactAgent(FnCallAgent):
             termination = 'answer not found'
             if num_llm_calls_available == 0:
                 termination = 'exceed available llm calls'
+        # Write tool log summary
+        if self.tool_logger:
+            self.tool_logger.write_summary(question, answer, prediction, termination, round)
         result = {
             "question": question,
             "answer": answer,
@@ -225,23 +255,48 @@ class MultiTurnReactAgent(FnCallAgent):
         }
         return result
 
-    def custom_call_tool(self, tool_name: str, tool_args: dict, **kwargs):
+    def custom_call_tool(self, tool_name: str, tool_args: dict, round_num: int = 0, **kwargs):
+        start_time = time.time()
+        error_msg = None
+        success = True
+
         if tool_name in TOOL_MAP:
-            tool_args["params"] = tool_args
-            if "python" in tool_name.lower():
-                result = TOOL_MAP['PythonInterpreter'].call(tool_args)
-            elif tool_name == "parse_file":
-                params = {"files": tool_args["files"]}
-                
-                raw_result = asyncio.run(TOOL_MAP[tool_name].call(params, file_root_path="./eval_data/file_corpus"))
-                result = raw_result
+            try:
+                tool_args["params"] = tool_args
+                if "python" in tool_name.lower():
+                    result = TOOL_MAP['PythonInterpreter'].call(tool_args)
+                elif tool_name == "parse_file":
+                    params = {"files": tool_args["files"]}
 
-                if not isinstance(raw_result, str):
-                    result = str(raw_result)
-            else:
-                raw_result = TOOL_MAP[tool_name].call(tool_args, **kwargs)
-                result = raw_result
-            return result
+                    raw_result = asyncio.run(TOOL_MAP[tool_name].call(params, file_root_path="./eval_data/file_corpus"))
+                    result = raw_result
 
+                    if not isinstance(raw_result, str):
+                        result = str(raw_result)
+                else:
+                    raw_result = TOOL_MAP[tool_name].call(tool_args, **kwargs)
+                    result = raw_result
+            except Exception as e:
+                result = f"Error executing {tool_name}: {str(e)}"
+                success = False
+                error_msg = str(e)
         else:
-            return f"Error: Tool {tool_name} not found"
+            result = f"Error: Tool {tool_name} not found"
+            success = False
+            error_msg = "Tool not found"
+
+        duration = time.time() - start_time
+
+        # Log the tool call if logger is available
+        if self.tool_logger:
+            self.tool_logger.log_tool_call(
+                round_num=round_num,
+                tool_name=tool_name,
+                tool_input=tool_args,
+                tool_output=result,
+                duration=duration,
+                success=success,
+                error=error_msg
+            )
+
+        return result

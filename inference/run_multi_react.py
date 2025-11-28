@@ -7,6 +7,7 @@ from tqdm import tqdm
 import threading
 from datetime import datetime
 from react_agent import MultiTurnReactAgent
+from tool_logger import ToolLogger, write_aggregate_stats
 import time
 import math
 
@@ -38,9 +39,19 @@ if __name__ == "__main__":
     model_name = os.path.basename(model.rstrip('/'))
 
     model_dir = os.path.join(output_base, f"{model_name}_sglang")
-    dataset_dir = os.path.join(model_dir, args.dataset)
+    # Strip .json/.jsonl extension from dataset path for cleaner directory names
+    dataset_path_clean = args.dataset
+    if dataset_path_clean.endswith('.jsonl'):
+        dataset_path_clean = dataset_path_clean[:-6]
+    elif dataset_path_clean.endswith('.json'):
+        dataset_path_clean = dataset_path_clean[:-5]
+    dataset_dir = os.path.join(model_dir, dataset_path_clean)
 
     os.makedirs(dataset_dir, exist_ok=True)
+
+    # Create tool_logs directory for detailed tool execution logs
+    tool_logs_dir = os.path.join(dataset_dir, "tool_logs")
+    os.makedirs(tool_logs_dir, exist_ok=True)
 
     print(f"Model name: {model_name}")
     print(f"Data set path: {args.dataset}")
@@ -116,9 +127,11 @@ if __name__ == "__main__":
     summary_rr_idx = 0
     # Sticky assignment per question
     question_to_ports = {}
+    # Track question indices for tool logging
+    question_index_counter = 0
     for rollout_idx in range(1, roll_out_count + 1):
         processed_queries = processed_queries_per_rollout[rollout_idx]
-        for item in items:
+        for item_idx, item in enumerate(items):
             question = item.get("question", "").strip()
             if question == "":
                 try:
@@ -138,12 +151,17 @@ if __name__ == "__main__":
                     question_to_ports[question] = planning_port
                     planning_rr_idx += 1
                 planning_port = question_to_ports[question]
+                # Use item_idx + start_idx for global question index
+                global_question_idx = start_idx + item_idx
                 tasks_to_run_all.append({
                     "item": item.copy(),
                     "rollout_idx": rollout_idx,
                     "planning_port": planning_port,
+                    "question_index": global_question_idx,
+                    "tool_logs_dir": tool_logs_dir,
                 })
                 per_rollout_task_counts[rollout_idx] += 1
+                question_index_counter += 1
 
     print(f"Total questions in current split: {len(items)}")
     for rollout_idx in range(1, roll_out_count + 1):
@@ -164,19 +182,33 @@ if __name__ == "__main__":
             'model_type': 'qwen_dashscope'
         }
 
-        test_agent = MultiTurnReactAgent(
-            llm=llm_cfg,
-            function_list=["search", "visit", "google_scholar", "PythonInterpreter"]
-        )
+        def run_task_with_logging(task, model, llm_cfg):
+            """Run a task with a dedicated tool logger."""
+            question_index = task.get("question_index", 0)
+            task_tool_logs_dir = task.get("tool_logs_dir", "")
+            question_text = task["item"].get("question", "")
+
+            # Create a unique tool logger for this task
+            tool_logger = ToolLogger(task_tool_logs_dir, question_index, question_text)
+
+            # Create agent with the tool logger
+            agent = MultiTurnReactAgent(
+                llm=llm_cfg,
+                function_list=["search", "visit", "google_scholar", "PythonInterpreter"],
+                tool_logger=tool_logger
+            )
+
+            return agent._run(task, model)
 
         write_locks = {i: threading.Lock() for i in range(1, roll_out_count + 1)}
 
         with ThreadPoolExecutor(max_workers=args.max_workers) as executor:
             future_to_task = {
                 executor.submit(
-                    test_agent._run,
+                    run_task_with_logging,
                     task,
-                    model
+                    model,
+                    llm_cfg
                 ): task for task in tasks_to_run_all
             }
 
@@ -226,4 +258,9 @@ if __name__ == "__main__":
 
         print("\nAll tasks completed!")
 
+        # Write aggregate tool usage statistics
+        print("\nGenerating aggregate tool usage statistics...")
+        write_aggregate_stats(tool_logs_dir)
+
     print(f"\nAll {roll_out_count} rollouts completed!")
+    print(f"Tool logs available at: {tool_logs_dir}")
